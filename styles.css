@@ -291,3 +291,6 @@ input[type=number] { -moz-appearance: textfield; }
   .env-left { font-size: 1.35rem; }
   .env-meta { font-size: .74rem; }
 }
+
+.toggle-row { display: flex; gap: 12px; align-items: flex-start; padding: 12px 14px; border: 1px solid var(--line); border-radius: var(--radius-sm); background: #fffdf9; font-size: .88rem; cursor: pointer; }
+.toggle-row input { width: 20px; height: 20px; margin: 1px 0 0; accent-color: var(--gold); flex: none; }

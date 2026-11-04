@@ -1,6 +1,6 @@
 // FlexBudget service worker: makes the app open offline.
 // Data lives in localStorage — this only caches the app's files.
-const CACHE = 'flexbudget-v1';
+const CACHE = 'flexbudget-v2';
 const SHELL = ['./', 'index.html', 'styles.css', 'app.js', 'manifest.webmanifest', 'icons/icon.svg', 'icons/icon-192.png', 'icons/apple-touch-icon.png'];
 
 self.addEventListener('install', (e) => {

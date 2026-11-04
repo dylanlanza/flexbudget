@@ -29,7 +29,7 @@
   function defaults() {
     return {
       version: 1,
-      settings: { name: '', currency: 'USD', incomeGoal: 0, sources: ['Services', 'Tips', 'Product sales', 'Other'], onboarded: false },
+      settings: { name: '', currency: 'USD', incomeGoal: 0, sources: ['Services', 'Tips', 'Product sales', 'Other'], onboarded: false, rollover: true },
       bills: [],        // { id, name, amount, dueDay, from, until? }
       categories: [],   // { id, name, mode: 'percent'|'fixed'|'leftover', value, color }
       income: [],       // { id, date, amount, source, note }
@@ -56,6 +56,7 @@
   }
   let state = load();
   function save() {
+    resetMemo();
     state.updatedAt = new Date().toISOString();
     try { localStorage.setItem(KEY, JSON.stringify(state)); }
     catch (e) { toast('Hmm, this browser blocked saving. Try turning off Private Browsing.'); }
@@ -89,7 +90,25 @@
   const activeBills = (m) => state.bills.filter((b) => (!b.from || b.from <= m) && (!b.until || m <= b.until)).sort((a, b) => (a.dueDay || 99) - (b.dueDay || 99));
   const catById = (id) => state.categories.find((c) => c.id === id);
 
+  // Carry-over: each month starts with what the previous month left behind.
+  //  - poolCarry: unassigned money (negative if last month's bills/plans outran income)
+  //  - catCarry:  each category's unused balance (negative if it was overspent)
+  // Results are memoized per month and cleared whenever data changes.
+  let memo = {};
+  let memoFirst;
+  const resetMemo = () => { memo = {}; memoFirst = undefined; };
+  const rolloverOn = () => state.settings.rollover !== false;
+  function firstMonth() {
+    if (memoFirst === undefined) {
+      const ms = [...state.income, ...state.spending].map((x) => (x.date || '').slice(0, 7))
+        .concat(state.bills.map((b) => b.from)).filter(Boolean).sort();
+      memoFirst = ms[0] || null;
+    }
+    return memoFirst;
+  }
+
   function summary(m, extraIncome = 0) {
+    if (!extraIncome && memo[m]) return memo[m];
     const income = state.income.filter(inMonth(m));
     const spending = state.spending.filter(inMonth(m));
     const earned = r2(sum(income) + extraIncome);
@@ -97,7 +116,16 @@
     const billsTotal = sum(bills);
     const paidIds = new Set(state.paid[m] || []);
     const billsPaid = sum(bills.filter((b) => paidIds.has(b.id)));
-    const flexible = r2(earned - billsTotal);
+
+    const prev = shiftMonth(m, -1);
+    const fm = firstMonth();
+    let poolCarry = 0, catCarry = {};
+    if (rolloverOn() && fm && prev >= fm) {
+      const p = summary(prev);
+      poolCarry = p.poolOut;
+      catCarry = p.catOut;
+    }
+    const flexible = r2(earned + poolCarry - billsTotal);
     const base = Math.max(0, flexible);
 
     const alloc = {};
@@ -124,14 +152,28 @@
       else uncategorized = r2(uncategorized + s.amount);
     }
     const totalSpent = sum(spending);
-    return { m, income, spending, earned, bills, billsTotal, billsPaid, paidIds, flexible, base, alloc, planned, unassigned, spent, uncategorized, totalSpent };
+
+    // Balance in each category = this month's share + what rolled in − what was spent.
+    const carry = {}, balance = {}, catOut = {};
+    let poolOut = r2(flexible - planned - uncategorized);
+    for (const c of state.categories) {
+      carry[c.id] = r2(catCarry[c.id] || 0);
+      balance[c.id] = r2((alloc[c.id] || 0) + carry[c.id] - (spent[c.id] || 0));
+      if (c.rollover === 'pool') poolOut = r2(poolOut + balance[c.id]);
+      else catOut[c.id] = balance[c.id];
+    }
+    const carriedToCats = r2(Object.values(carry).reduce((t, v) => t + v, 0));
+
+    const out = { m, income, spending, earned, poolCarry: r2(poolCarry), carry, carriedToCats, bills, billsTotal, billsPaid, paidIds, flexible, base, alloc, planned, unassigned, spent, uncategorized, totalSpent, balance, poolOut, catOut };
+    if (!extraIncome) memo[m] = out;
+    return out;
   }
 
   // How a new deposit would be divided (first covers bills, then the categories).
   function splitPreview(m, amount) {
     const before = summary(m), after = summary(m, amount);
     const lines = [];
-    const toBills = r2(Math.min(amount, Math.max(0, before.billsTotal - before.earned)));
+    const toBills = r2(Math.min(amount, Math.max(0, -before.flexible)));
     if (toBills > 0) lines.push({ label: 'Covers bills', amount: toBills, color: 'var(--gold)' });
     for (const c of state.categories) {
       const d = r2((after.alloc[c.id] || 0) - (before.alloc[c.id] || 0));
@@ -260,16 +302,23 @@
   }
 
   function envelope(c, s) {
-    const a = s.alloc[c.id] || 0, sp = s.spent[c.id] || 0, left = r2(a - sp);
-    const pct = a > 0 ? Math.min(100, (sp / a) * 100) : (sp > 0 ? 100 : 0);
+    const cr = s.carry[c.id] || 0, a = r2((s.alloc[c.id] || 0) + cr), sp = s.spent[c.id] || 0, left = s.balance[c.id] || 0;
+    const pct = a > 0 ? Math.min(100, (sp / a) * 100) : (sp > 0 || a < 0 ? 100 : 0);
     const over = left < 0;
     const rule = c.mode === 'percent' ? `${r2(c.value)}% of flexible` : c.mode === 'fixed' ? 'Set amount' : 'Gets leftovers';
     return `<button class="env" data-action="filter-cat" data-id="${c.id}">
       <div class="env-top"><span class="dot" style="background:${c.color}"></span><span class="name">${esc(c.name)}</span></div>
       <div class="env-left ${over ? 'clay-text' : ''}">${over ? money(-left) + ' over' : money(left)}</div>
-      <div class="env-meta">${money(sp)} spent of ${money(a)} · ${rule}</div>
+      <div class="env-meta">${money(sp)} spent of ${money(a)} · ${rule}${carryNote(cr)}</div>
       <div class="meter ${over ? 'over' : ''}"><i style="width:${pct}%;${over ? '' : `background:${c.color}`}"></i></div>
     </button>`;
+  }
+
+  const prevName = (m) => monthName(shiftMonth(m, -1), { month: 'long' });
+  function carryNote(cr) {
+    if (Math.abs(cr) < 0.005) return '';
+    return cr > 0 ? `<br><span class="sage-text">+${money(cr)} rolled over from ${esc(prevName(ui.month))}</span>`
+      : `<br><span class="clay-text">−${money(-cr)} overspent in ${esc(prevName(ui.month))}</span>`;
   }
 
   function allocationBar(s) {
@@ -299,9 +348,9 @@
   function viewOverview() {
     const s = summary(ui.month);
     const goal = Number(state.settings.incomeGoal) || 0;
-    const covered = s.billsTotal > 0 ? Math.min(100, (s.earned / s.billsTotal) * 100) : 100;
+    const covered = s.billsTotal > 0 ? Math.max(0, Math.min(100, ((s.earned + s.poolCarry) / s.billsTotal) * 100)) : 100;
     const paidCount = s.bills.filter((b) => s.paidIds.has(b.id)).length;
-    const leftToSpend = r2(state.categories.reduce((t, c) => t + Math.max(0, (s.alloc[c.id] || 0) - (s.spent[c.id] || 0)), 0));
+    const leftToSpend = r2(state.categories.reduce((t, c) => t + Math.max(0, s.balance[c.id] || 0), 0));
 
     const recent = [
       ...s.income.map((t) => ({ t, k: 'in' })),
@@ -314,7 +363,7 @@
         <section class="card hero">
           <p class="eyebrow">Flexible money · ${esc(monthName(ui.month, { month: 'long' }))}</p>
           <h2 class="hero-num num ${s.flexible < 0 ? 'neg' : ''}">${money(s.flexible)}</h2>
-          <p class="hero-sub">${money(s.earned)} earned − ${money(s.billsTotal)} in bills</p>
+          <p class="hero-sub">${money(s.earned)} earned${Math.abs(s.poolCarry) >= 0.005 ? ` ${s.poolCarry > 0 ? '+' : '−'} ${money(Math.abs(s.poolCarry))} ${s.poolCarry > 0 ? 'carried over' : 'short from last month'}` : ''} − ${money(s.billsTotal)} in bills</p>
           ${s.billsTotal > 0 ? `
             <div class="meter-label"><span>Bills covered</span><span class="num">${Math.round(covered)}%</span></div>
             <div class="meter gold"><i style="width:${covered}%"></i></div>
@@ -387,6 +436,9 @@
         </section>
         <section class="card">
           <div class="card-head"><h3>${esc(monthName(ui.month, { month: 'long' }))} so far</h3><span class="num" style="font-family:var(--serif);font-size:1.5rem;font-weight:600">${money(s.earned)}</span></div>
+          ${Math.abs(s.poolCarry) >= 0.005 ? `<div class="notice ${s.poolCarry > 0 ? 'sage' : 'clay'}" style="margin-bottom:14px">${s.poolCarry > 0
+            ? `<b>+${money(s.poolCarry)}</b> carried over from ${esc(prevName(ui.month))} — it's added to this month's money to divvy up.`
+            : `${esc(prevName(ui.month))} ended <b>${money(-s.poolCarry)}</b> short, so that comes out of this month first.`}</div>` : ''}
           ${goal > 0 ? `<div class="meter-label"><span>Monthly goal</span><span class="num">${money(s.earned)} / ${money(goal)}</span></div><div class="meter gold"><i style="width:${Math.min(100, (s.earned / goal) * 100)}%"></i></div>` : ''}
           <form class="form" data-form="goal" style="margin-top:14px">
             <div class="form-row" style="grid-template-columns:1fr auto;align-items:end">
@@ -435,7 +487,7 @@
       ${moneyField('amount', t.amount ?? '', { big: true, autofocus: true })}
       <label class="field">Category</label>
       <div class="chips" role="radiogroup">
-        ${state.categories.map((c) => `<label class="chip ${c.id === selected ? 'active' : ''}"><input type="radio" name="categoryId" value="${c.id}" ${c.id === selected ? 'checked' : ''} hidden /><i class="dot" style="background:${c.color}"></i>${esc(c.name)} <span class="muted num">${money(r2((s.alloc[c.id] || 0) - (s.spent[c.id] || 0)))}</span></label>`).join('')}
+        ${state.categories.map((c) => `<label class="chip ${c.id === selected ? 'active' : ''}"><input type="radio" name="categoryId" value="${c.id}" ${c.id === selected ? 'checked' : ''} hidden /><i class="dot" style="background:${c.color}"></i>${esc(c.name)} <span class="muted num">${money(s.balance[c.id] || 0)}</span></label>`).join('')}
         ${t.id && !catById(t.categoryId) ? '<label class="chip active"><input type="radio" name="categoryId" value="" checked hidden />Uncategorized</label>' : ''}
       </div>
       <div class="form-row stack-sm">
@@ -519,7 +571,7 @@
         </div>
         <span class="dot" style="background:${c.color};width:14px;height:14px"></span>
         <div class="main clickable" data-action="edit-cat" data-id="${c.id}" style="cursor:pointer"><div class="title">${esc(c.name)}</div><div class="meta">${rule}</div></div>
-        <div style="text-align:right"><div class="amt">${money(s.alloc[c.id] || 0)}</div><div class="meta muted" style="font-size:.75rem">${money(s.spent[c.id] || 0)} spent</div></div>
+        <div style="text-align:right"><div class="amt">${money(s.alloc[c.id] || 0)}</div><div class="meta muted" style="font-size:.75rem">${Math.abs(s.carry[c.id] || 0) >= 0.005 ? `${(s.carry[c.id] > 0 ? '+' : '−') + money(Math.abs(s.carry[c.id]))} rolled · ` : ''}${money(s.spent[c.id] || 0)} spent</div></div>
       </li>`;
     }).join('');
 
@@ -569,6 +621,13 @@
         ${moneyField('fixed', mode === 'fixed' ? c.value : '', { label: 'Amount each month' }).replace('required', '')}
       </div>
       <p class="muted" data-mode-field="leftover" style="margin:0;font-size:.85rem" ${mode === 'leftover' ? '' : 'hidden'}>Anything not claimed by your other categories lands here — great for savings.</p>
+      <label class="field">At the end of the month, unused money…</label>
+      <div class="seg" data-seg="roll">
+        <button type="button" data-roll="keep" class="${c.rollover !== 'pool' ? 'active' : ''}">Stays here</button>
+        <button type="button" data-roll="pool" class="${c.rollover === 'pool' ? 'active' : ''}">Goes back to divvy</button>
+      </div>
+      <input type="hidden" name="rollover" value="${c.rollover === 'pool' ? 'pool' : 'keep'}" />
+      ${rolloverOn() ? '' : '<p class="muted" style="margin:-4px 0 0;font-size:.8rem">Carry-over is turned off in Settings, so nothing moves to next month right now.</p>'}
       <label class="field">Color</label>
       <div class="swatches">${PALETTE.map((p) => `<button type="button" class="swatch ${p === color ? 'active' : ''}" data-color="${p}" style="background:${p}" aria-label="Color ${p}"></button>`).join('')}</div>
       <input type="hidden" name="color" value="${color}" />
@@ -593,6 +652,10 @@
           <form class="form" data-form="settings">
             <label class="field">Your name<input class="input" name="name" maxlength="30" value="${esc(st.name)}" placeholder="for the greeting" /></label>
             <label class="field">Currency<select class="input" name="currency">${currencies.map(([c, n]) => `<option value="${c}" ${c === st.currency ? 'selected' : ''}>${n} (${c})</option>`).join('')}</select></label>
+            <label class="toggle-row">
+              <input type="checkbox" name="rollover" ${rolloverOn() ? 'checked' : ''} />
+              <span><b>Carry leftovers into next month</b><br><span class="muted">Unassigned income and unused category money roll forward. Overspending carries too, so the numbers stay honest.</span></span>
+            </label>
             <label class="field">Income sources <span class="muted" style="font-weight:400">— one per line</span><textarea class="input" name="sources" rows="4">${esc(st.sources.join('\n'))}</textarea></label>
             <div class="btn-row end"><button class="btn gold" type="submit">Save</button></div>
           </form>
@@ -624,6 +687,7 @@
   // ---------- render ----------
   const views = { overview: viewOverview, income: viewIncome, bills: viewBills, categories: viewCategories, settings: viewSettings };
   function render({ animate = false } = {}) {
+    resetMemo();
     renderHeader();
     const v = $('#view');
     v.innerHTML = views[ui.tab]();
@@ -683,7 +747,7 @@
     const c = catById(data.categoryId);
     if (c) {
       const s = summary(ui.month);
-      const left = r2((s.alloc[c.id] || 0) - (s.spent[c.id] || 0));
+      const left = s.balance[c.id] || 0;
       toast(left >= 0 ? `${money(left)} left in ${c.name}.` : `${c.name} is ${money(-left)} over for the month.`);
     } else toast('Spending saved.');
   }
@@ -708,9 +772,10 @@
     if (mode === 'percent') { value = r2(fd.get('percent')); if (value <= 0 || value > 100) return toast('Choose a percent between 0 and 100.'); }
     if (mode === 'fixed') { value = parseAmount(fd.get('fixed')); if (!(value > 0)) return toast('Enter the monthly amount.'); }
     const color = fd.get('color') || PALETTE[0];
+    const rollover = fd.get('rollover') === 'pool' ? 'pool' : 'keep';
     const id = form.dataset.editId;
-    if (id) Object.assign(catById(id), { name, mode, value, color });
-    else state.categories.push({ id: uid(), name, mode, value, color });
+    if (id) Object.assign(catById(id), { name, mode, value, color, rollover });
+    else state.categories.push({ id: uid(), name, mode, value, color, rollover });
     save(); closeSheet(); render();
     toast(id ? 'Category updated.' : `${name} created.`);
   }
@@ -782,6 +847,13 @@
       $$('[data-seg="mode"] button', form).forEach((b) => b.classList.toggle('active', b === modeBtn));
       form.elements.mode.value = modeBtn.dataset.mode;
       $$('[data-mode-field]', form).forEach((el) => { el.hidden = el.dataset.modeField !== modeBtn.dataset.mode; });
+      return;
+    }
+    const rollBtn = e.target.closest('[data-seg="roll"] button');
+    if (rollBtn) {
+      const form = rollBtn.closest('form');
+      $$('[data-seg="roll"] button', form).forEach((b) => b.classList.toggle('active', b === rollBtn));
+      form.elements.rollover.value = rollBtn.dataset.roll;
       return;
     }
     const sw = e.target.closest('.swatch');
@@ -910,6 +982,7 @@
     settings: (fd) => {
       state.settings.name = String(fd.get('name') || '').trim();
       state.settings.currency = fd.get('currency') || 'USD';
+      state.settings.rollover = fd.get('rollover') === 'on';
       const src = String(fd.get('sources') || '').split('\n').map((s) => s.trim()).filter(Boolean);
       state.settings.sources = src.length ? [...new Set(src)] : ['Income'];
       save(); render(); toast('Saved.');
